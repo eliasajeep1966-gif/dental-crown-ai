@@ -354,32 +354,43 @@ def surface_distance_report(mesh: trimesh.Trimesh, points: np.ndarray, units_per
 
 
 def boundary_edges(mesh: trimesh.Trimesh) -> np.ndarray:
-    """Return open boundary edges (one incident face); closed STL has none."""
-    unique_edges = np.asarray(mesh.edges_unique)
-    inverse = np.asarray(mesh.edges_unique_inverse)
+    """Return boundary segments after welding duplicated STL triangle vertices."""
+    topology = mesh.copy()
+    # STL stores each triangle independently; merge identical coordinates first or
+    # every triangle's three sides can be falsely classified as open boundaries.
+    topology.merge_vertices(digits_vertex=8)
+    unique_edges = np.asarray(topology.edges_unique)
+    inverse = np.asarray(topology.edges_unique_inverse)
     counts = np.bincount(inverse, minlength=len(unique_edges))
-    return unique_edges[counts == 1]
+    edge_indices = unique_edges[counts == 1]
+    segments = np.asarray(topology.vertices, dtype=np.float64)[edge_indices]
+    return segments.reshape((-1, 2, 3))
 
 
 def boundary_edge_distance_report(mesh: trimesh.Trimesh, points: np.ndarray,
                                   units_per_mm: float) -> dict:
     """Exact point-to-segment distances for open mesh boundary edges."""
-    edges = boundary_edges(mesh)
-    if len(edges) == 0:
+    segments = boundary_edges(mesh)
+    if len(segments) == 0:
         return {
             "available": False,
             "reason": "STL has no open boundary edges; a crown margin loop cannot be inferred from this mesh.",
             "boundary_edge_count": 0,
+            "topology_weld_digits_vertex": 8,
         }
 
-    vertices = np.asarray(mesh.vertices, dtype=np.float64)
-    starts = vertices[edges[:, 0]]
-    vectors = vertices[edges[:, 1]] - starts
+    starts = segments[:, 0, :]
+    vectors = segments[:, 1, :] - starts
     lengths_squared = np.einsum("ij,ij->i", vectors, vectors)
     valid = lengths_squared > 1e-20
     starts, vectors, lengths_squared = starts[valid], vectors[valid], lengths_squared[valid]
     if len(starts) == 0:
-        return {"available": False, "reason": "All boundary edges are degenerate.", "boundary_edge_count": int(len(edges))}
+        return {
+            "available": False,
+            "reason": "All boundary edges are degenerate.",
+            "boundary_edge_count": int(len(segments)),
+            "topology_weld_digits_vertex": 8,
+        }
 
     minimum_squared = np.full(len(points), np.inf, dtype=np.float64)
     # Bound memory while calculating exact closest points on line segments.
@@ -399,7 +410,8 @@ def boundary_edge_distance_report(mesh: trimesh.Trimesh, points: np.ndarray,
     distances_mm = np.sqrt(minimum_squared) / units_per_mm
     return {
         "available": True,
-        "boundary_edge_count": int(len(edges)),
+        "boundary_edge_count": int(len(segments)),
+        "topology_weld_digits_vertex": 8,
         "point_count": int(len(distances_mm)),
         "max_mm": float(np.max(distances_mm)),
         "median_mm": float(np.median(distances_mm)),
@@ -491,6 +503,13 @@ def main() -> int:
             jaw_dir = output_dir / "jaw_candidates"
             jaw_dir.mkdir(parents=True, exist_ok=True)
             jaw_candidate_reports: dict[str, dict] = {}
+            jaw_geometry.export(str(jaw_dir / "mandibular_raw.ply"))
+            try:
+                jaw_candidate_reports["jaw_raw"] = surface_distance_report(
+                    jaw_geometry, margins, args.units_per_mm
+                )
+            except Exception as exc:
+                jaw_candidate_reports["jaw_raw"] = {"error": str(exc)}
             for variant_name, transform in matrix_variants(jaw_matrix):
                 candidate_mesh = jaw_geometry.copy()
                 candidate_mesh.apply_transform(transform)
