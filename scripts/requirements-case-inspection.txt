@@ -1,0 +1,8 @@
+# Environment for scripts/inspect_case_alignment.py
+# Python 3.11 on Windows is recommended for this first local inspection.
+numpy>=1.26
+scipy>=1.11
+trimesh>=4.0
+h5py>=3.10
+rarfile>=4.2
+rtree>=1.2
