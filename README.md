@@ -16,6 +16,7 @@
 
 - [مراحل التشغيل ومواصفة الإدخال](docs/OPERATING_WORKFLOW.md)
 - [قواعد المشروع](docs/PROJECT_RULES.md)
+- [متطلبات النظام التقنية](docs/TECHNICAL_REQUIREMENTS.md)
 - [تعليمات الوكيل](AGENTS.md)
 - [سجل التقدم والقرارات](PROJECT_LOG.md)
 
