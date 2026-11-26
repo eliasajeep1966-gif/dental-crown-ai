@@ -6,7 +6,6 @@ from pathlib import Path
 from torch.utils.data import Dataset
 from pytorch3d.ops import sample_farthest_points
 import h5py
-import re
 
 def random_rotate_point_cloud(pna,crown,normals, rotation_axes=('x', 'y', 'z')):
     rotation_matrix = torch.eye(3)
@@ -47,11 +46,18 @@ def random_rotate_point_cloud(pna,crown,normals, rotation_axes=('x', 'y', 'z')):
     return rotated_pna,rotated_crown,rotated_crown_normals
 
 class IOS_Dataset(Dataset):
-    def __init__(self, root_dir, is_train=True, crop_size=(20.0, 20.0, 20.0),sample_points=1024):
+    def __init__(self, root_dir, is_train=True, crop_size=(20.0, 20.0, 20.0), sample_points=1024, template_dir=None):
         self.istrain = is_train
         self.root_dir = Path(root_dir)
         self.crop_size = crop_size
         self.sample_points = sample_points
+        self.template_dir = (
+            Path(template_dir).expanduser().resolve()
+            if template_dir is not None
+            else Path(__file__).resolve().parents[1] / 'fdi_template'
+        )
+        if not self.template_dir.is_dir():
+            raise FileNotFoundError(f'FDI template directory not found: {self.template_dir}')
         self.subdirs = ['14','15','16', '17', '24', '25', '26', '27','34', '36', '37','44', '45', '46', '47' ]
        
        
@@ -62,34 +68,59 @@ class IOS_Dataset(Dataset):
                 case_dir = subdir_path / 'train' 
             else:
                 case_dir = subdir_path / 'test'
-            for case in os.listdir(case_dir):
-                abs_case = os.path.join(case_dir, case)
+            if not case_dir.is_dir():
+                continue
+            for case_path in sorted(case_dir.iterdir()):
+                if not case_path.is_dir():
+                    continue
+                abs_case = str(case_path)
                 crown_file = os.path.join(abs_case, 'crown.ply')
                 pna_crop_file = os.path.join(abs_case, 'pna_crop.ply')
                 psr_grid = os.path.join(abs_case,'psr_my.npz')
                 curvature = os.path.join(abs_case,'crown_attributes.h5')
                 prepare_margin = os.path.join(abs_case,'boundary_labels.npy')
-                self.data_paths.append((abs_case, crown_file,pna_crop_file,psr_grid,curvature,prepare_margin))
+                self.data_paths.append((int(subdir), abs_case, crown_file,pna_crop_file,psr_grid,curvature,prepare_margin))
+
+        if not self.data_paths:
+            split = 'train' if is_train else 'test'
+            raise FileNotFoundError(f'No case folders found under {self.root_dir}/<tooth>/{split}')
 
     def __len__(self):
         return len(self.data_paths)
     
-    def normalize_point_cloud(self, point_cloud,transition = 0.0,scale=1.0):
-        point_cloud_center = (torch.min(point_cloud,dim=0)[0] + torch.max(point_cloud,dim=0)[0]) /2
-        
-        crop_scale = torch.tensor(self.crop_size, dtype=torch.float32) / 2
-        
-        normalized_point_cloud = (point_cloud - point_cloud_center ) / (crop_scale )
-        
-        return normalized_point_cloud
+    def normalize_point_cloud(self, point_cloud, transition=0.0, scale=1.0, center=None):
+        """Normalize a cloud; pass one shared center for aligned crown/PNA inputs."""
+        if center is None:
+            center = (torch.min(point_cloud, dim=0)[0] + torch.max(point_cloud, dim=0)[0]) / 2
+        else:
+            center = torch.as_tensor(center, dtype=point_cloud.dtype, device=point_cloud.device)
+
+        crop_scale = torch.as_tensor(self.crop_size, dtype=point_cloud.dtype, device=point_cloud.device) / 2
+        return (point_cloud - center) / crop_scale
     
     def get_curvature(self,dirpath):
         with h5py.File(dirpath, 'r') as f:
-            curvatures = f['curvatures'][:]
-            curvatures_tensor = torch.tensor((curvatures-np.min(curvatures)/(np.max(curvatures)-np.min(curvatures)+1e-6)))
-            margine = f["whetherismarginline"][:]
-            margine_tensor = torch.tensor(margine)
-            return curvatures_tensor,margine_tensor
+            curvatures = np.asarray(f['curvatures'][:], dtype=np.float32)
+            margine = np.asarray(f['whetherismarginline'][:], dtype=np.float32)
+
+        if curvatures.ndim != 1 or curvatures.size == 0:
+            raise ValueError('curvatures must be a non-empty 1-D array')
+        if margine.shape != curvatures.shape:
+            raise ValueError('curvatures and whetherismarginline must have matching shapes')
+        if not np.isfinite(curvatures).all() or not np.isfinite(margine).all():
+            raise ValueError('curvatures and whetherismarginline must contain only finite values')
+
+        curv_min = float(np.min(curvatures))
+        curv_range = float(np.max(curvatures)) - curv_min
+        if curv_range <= np.finfo(np.float32).eps:
+            normalized_curvatures = np.zeros_like(curvatures)
+        else:
+            # The upstream expression omitted parentheses and did not perform min-max scaling.
+            normalized_curvatures = (curvatures - curv_min) / curv_range
+
+        curvatures_tensor = torch.as_tensor(normalized_curvatures, dtype=torch.float32)
+        margine_tensor = torch.as_tensor(margine, dtype=torch.float32)
+        return curvatures_tensor, margine_tensor
 
     def crop_mesh(self, mesh: trimesh.Trimesh, center: np.ndarray, size: float,has_pre_pare=False):
         vertices = mesh.vertices
@@ -126,22 +157,24 @@ class IOS_Dataset(Dataset):
         
         return hemisphere_points
 
-    def get_template(self, dirpath):
-        match = re.search(r"/(\d+)/", dirpath)
-        if match:
-            tooth_number = int(match.group(1))
-        template_path = os.path.join(
-            '/mnt/disk1/linda/DCrownFormer/fdi_template',
-            f'{tooth_number}crown.ply'
-        )
-        template_vertices = trimesh.load(template_path).vertices
+    def get_template(self, tooth_number):
+        """Load the FDI template from the bundled or explicitly configured directory."""
+        template_path = self.template_dir / f'{int(tooth_number)}crown.ply'
+        if not template_path.is_file():
+            raise FileNotFoundError(f'FDI template not found for tooth {tooth_number}: {template_path}')
+        template_mesh = trimesh.load(template_path, process=False)
+        if isinstance(template_mesh, trimesh.Scene):
+            template_mesh = template_mesh.dump(concatenate=True)
+        if not isinstance(template_mesh, trimesh.Trimesh) or len(template_mesh.vertices) == 0:
+            raise ValueError(f'FDI template is empty or invalid: {template_path}')
+        template_vertices = template_mesh.vertices
         template_vertices = torch.tensor(template_vertices,dtype=torch.float32)
         template_vertices = self.normalize_point_cloud(template_vertices)
         template_vertices = sample_farthest_points(template_vertices[None,...],K=self.sample_points)[0].squeeze()
         return template_vertices
 
     def __getitem__(self, idx):
-        dirpath, crown_file, pna_crop_file,psr_file,attributes,prepared_tooth_npy = self.data_paths[idx]
+        tooth_number, dirpath, crown_file, pna_crop_file,psr_file,attributes,prepared_tooth_npy = self.data_paths[idx]
      
         crown_mesh = trimesh.load(crown_file,process=False)
         prepare_margin_label = np.load(prepared_tooth_npy)
@@ -160,7 +193,7 @@ class IOS_Dataset(Dataset):
         crown_normal_tensor = torch.tensor(crown_cropped_mesh.vertex_normals, dtype=torch.float32)
         pna_crop_tensor = torch.tensor(pna_crop_cropped_mesh.vertices, dtype=torch.float32)
         psr_grid = torch.tensor(np.load(psr_file)['psr'],dtype=torch.float32)
-        template = self.get_template(dirpath)
+        template = self.get_template(tooth_number)
         
         if self.istrain and False :
             pna_crop_tensor,crown_tensor,crown_normal_tensor = random_rotate_point_cloud(pna_crop_tensor,crown_tensor,crown_normal_tensor, rotation_axes=('x', 'y', 'z'))
@@ -170,8 +203,9 @@ class IOS_Dataset(Dataset):
             crown_tensor = crown_tensor * scale + translation_tensor
             pna_crop_tensor = pna_crop_tensor * scale + translation_tensor
 
-        crown_tensor = self.normalize_point_cloud(crown_tensor,0.0,1.0)
-        pna_crop_tensor = self.normalize_point_cloud(pna_crop_tensor,0.0,1.0)
+        # Use the same origin and scale so the crown remains aligned to the jaw scan.
+        crown_tensor = self.normalize_point_cloud(crown_tensor, center=crown_center)
+        pna_crop_tensor = self.normalize_point_cloud(pna_crop_tensor, center=crown_center)
        
         crown_sampled, crown_sample_idx = sample_farthest_points(crown_tensor[None, :, :], K=4*self.sample_points)
         crown_sampled = crown_sampled.squeeze()
@@ -183,4 +217,3 @@ class IOS_Dataset(Dataset):
         pna_crop_sampled = torch.cat([pna_crop_sampled.squeeze(),cropped_margin_label],dim=1)
         
         return pna_crop_sampled, crown_sampled, crown_center, template,psr_grid, crown_curvatures,margine,dirpath
-

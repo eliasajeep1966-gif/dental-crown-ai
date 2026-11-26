@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pathlib import Path
 from pytorch3d.ops import sample_farthest_points as furthest_point_sample
 from models.SAP.src.dpsr import DPSR
 from models.SAP.src.model import Encode2Points
@@ -9,7 +10,7 @@ from models.SAP.src.model import Encode2Points
 def gather_points(points, idx):
     batch_size, _, _ = points.size()
     _, num_points = idx.size()
-    batch_indices = torch.arange(batch_size).unsqueeze(1).expand(-1, num_points)
+    batch_indices = torch.arange(batch_size, device=points.device).unsqueeze(1).expand(-1, num_points)
     gathered_points = points[batch_indices, :, idx].transpose(1, 2)
     return gathered_points
 
@@ -139,16 +140,18 @@ class PCT_encoder(nn.Module):
 
 
 class CrownDeformer(nn.Module):
-    def __init__(self, steps=(2, 2)):
+    def __init__(self, steps=(2, 2), sap_config_path=None, psr_resolution=128):
         super().__init__()
         step1, step2 = steps
         self.encoder = PCT_encoder()
         self.refine = PCT_refine_mod(ratio=step1, feature_level=2)
         self.refine1 = PCT_refine_mod(ratio=step2, final=False, feature_level=1)
-        self.dpsr = DPSR(res=(128, 128, 128), sig=0)
-        self.model_sap = Encode2Points(
-            "/mnt/disk1/linda/DCrownFormer/models/SAP/configs/learning_based/noise_small/ours.yaml"
-        )
+        if psr_resolution < 16:
+            raise ValueError('psr_resolution must be at least 16')
+        self.dpsr = DPSR(res=(psr_resolution, psr_resolution, psr_resolution), sig=0)
+        if sap_config_path is None:
+            sap_config_path = Path(__file__).resolve().parent / 'SAP/configs/learning_based/noise_small/ours.yaml'
+        self.model_sap = Encode2Points(str(sap_config_path))
 
     def forward(self, x, template=None, is_training=True):
         x = x.transpose(1, 2)
@@ -163,5 +166,3 @@ class CrownDeformer(nn.Module):
         fine_output, normals = self.model_sap(fine_output)
         pred_psr = self.dpsr(fine_output, normals)
         return pred_psr, seed, fine, fine1
-
-
