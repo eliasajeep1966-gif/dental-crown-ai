@@ -1,0 +1,4 @@
+# Local CPU-only preparation for one MADCrowner-format sample.
+# PyTorch/PyTorch3D are not needed; PSR is computed with the included NumPy implementation.
+-r requirements-case-inspection.txt
+vtk>=9.2
