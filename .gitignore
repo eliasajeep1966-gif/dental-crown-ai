@@ -1,0 +1,27 @@
+# Patient/case data: keep local, never commit
+*.ply
+*.stl
+*.constructionInfo
+*.h5
+*.npz
+*.npy
+*.dcm
+*.zip
+*.7z
+/data/
+/datasets/
+/cases/
+
+# Model weights and training outputs
+*.pth
+*.pt
+*.ckpt
+/checkpoints/
+/runs/
+/logs/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
