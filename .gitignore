@@ -25,3 +25,6 @@
 venv/
 __pycache__/
 *.py[cod]
+
+# Published MADCrowner reference templates (not patient-case data)
+!/third_party/MADCrowner/fdi_template/*.ply

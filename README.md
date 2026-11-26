@@ -10,6 +10,8 @@
 
 ندرس تكييف مشروع [MADCrowner](https://github.com/lullcant/MADCrowner) كنقطة بداية، بدل بناء نموذج ثلاثي الأبعاد من الصفر. المشروع البحثي يحتاج إلى تكييف ليتوافق مع ملفات Medit وexocad وطريقة تنظيم بياناتنا.
 
+نسخة المصدر المرجعية موجودة في `third_party/MADCrowner`، ومعلومات commit المصدر والتراخيص موثقة في [`UPSTREAM_SOURCE.md`](third_party/MADCrowner/UPSTREAM_SOURCE.md).
+
 ## ملفات المشروع
 
 - [مراحل التشغيل ومواصفة الإدخال](docs/OPERATING_WORKFLOW.md)
