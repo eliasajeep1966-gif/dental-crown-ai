@@ -66,10 +66,26 @@ def matrix_from_xml(el: ET.Element) -> np.ndarray | None:
     return None
 
 
+def affine_layout_checks(matrix: np.ndarray) -> dict[str, bool]:
+    """Structural check only: does this interpretation have an affine last row?"""
+    return {
+        "as_tagged": bool(np.allclose(matrix[3], [0, 0, 0, 1], atol=1e-5)),
+        "transpose": bool(np.allclose(matrix.T[3], [0, 0, 0, 1], atol=1e-5)),
+    }
+
+
 def matrix_variants(matrix: np.ndarray) -> list[tuple[str, np.ndarray]]:
-    """Export both matrix-layout and direction hypotheses; none is pre-certified."""
+    """Test affine-plausible layouts and their inverses; plausibility is not proof."""
+    checks = affine_layout_checks(matrix)
+    layouts = [("as_tagged", matrix)] if checks["as_tagged"] else []
+    if checks["transpose"]:
+        layouts.append(("transpose", matrix.T))
+    # If neither layout passes the structural test, retain candidates for diagnosis,
+    # but the report will make the failed affine checks explicit.
+    if not layouts:
+        layouts = [("as_tagged", matrix), ("transpose", matrix.T)]
     variants: list[tuple[str, np.ndarray]] = []
-    for layout, base in (("as_tagged", matrix), ("transpose", matrix.T)):
+    for layout, base in layouts:
         variants.append((f"{layout}_forward", base))
         try:
             variants.append((f"{layout}_inverse", np.linalg.inv(base)))
@@ -122,6 +138,8 @@ def parse_case_xml(xml_path: Path) -> dict:
     if not margin_points:
         raise ValueError("لم أجد Vec3 داخل Margin.")
 
+    parent_map = {child: parent for parent in root.iter() for child in parent}
+
     # In the actual file each ScanFile has its own FileName and TransformationMatrix.
     scan_groups = named(root, "ScanFiles")
     if len(scan_groups) != 1:
@@ -141,6 +159,7 @@ def parse_case_xml(xml_path: Path) -> dict:
             "file_ref": file_matches[0].strip().replace("\\", "/"),
             "matrix": scan_matrix,
             "matrix_present": scan_matrix is not None,
+            "affine_layout_checks": affine_layout_checks(scan_matrix) if scan_matrix is not None else None,
         })
     if not scan_records:
         raise ValueError("لم أجد عناصر ScanFile داخل ScanFiles.")
@@ -153,7 +172,6 @@ def parse_case_xml(xml_path: Path) -> dict:
             raise ValueError("وجدت MatrixToScanDataFiles لكن لم أستطع قراءة حقول _00 إلى _33.")
         # Keep only tag names in scope metadata, never patient values or filenames.
         ancestors = []
-        parent_map = {child: parent for parent in root.iter() for child in parent}
         parent = parent_map.get(matrix_el)
         while parent is not None:
             ancestors.append(local_name(parent.tag))
@@ -161,10 +179,33 @@ def parse_case_xml(xml_path: Path) -> dict:
         scope = "construction_file" if "constructionfile" in ancestors else "root"
         construction_matrices.append({"matrix": matrix, "scope": scope})
 
+    z_rotation_matrices: list[dict] = []
+    for matrix_el in named(root, "ZRotationMatrix"):
+        matrix = matrix_from_xml(matrix_el)
+        if matrix is None:
+            raise ValueError("وجدت ZRotationMatrix لكن لم أستطع قراءة حقول _00 إلى _33.")
+        ancestors = []
+        parent = parent_map.get(matrix_el)
+        while parent is not None:
+            ancestors.append(local_name(parent.tag))
+            parent = parent_map.get(parent)
+        if "constructionfile" in ancestors:
+            scope = "construction_file"
+        elif "tooth" in ancestors:
+            scope = "tooth"
+        else:
+            scope = "other"
+        z_rotation_matrices.append({
+            "matrix": matrix,
+            "scope": scope,
+            "affine_layout_checks": affine_layout_checks(matrix),
+        })
+
     return {
         "margin_points": np.asarray(margin_points, dtype=np.float64),
         "scan_records": scan_records,
         "construction_matrices": construction_matrices,
+        "z_rotation_matrices": z_rotation_matrices,
     }
 
 
@@ -278,7 +319,12 @@ def apply_transform(points: np.ndarray, matrix: np.ndarray) -> np.ndarray:
 
 
 def load_geometry(path: Path):
-    geometry = trimesh.load(str(path), process=False)
+    # Medit PLY may reference an external JPG texture. Geometry-only loading avoids
+    # resolver warnings (which can expose the referenced filename) and keeps vertices.
+    load_options = {"process": False}
+    if path.suffix.casefold() == ".ply":
+        load_options["skip_materials"] = True
+    geometry = trimesh.load(str(path), **load_options)
     if isinstance(geometry, trimesh.Scene):
         geometry = geometry.dump(concatenate=True)
     if not isinstance(geometry, (trimesh.Trimesh, trimesh.points.PointCloud)) or len(geometry.vertices) == 0:
@@ -307,6 +353,72 @@ def surface_distance_report(mesh: trimesh.Trimesh, points: np.ndarray, units_per
     }
 
 
+def boundary_edges(mesh: trimesh.Trimesh) -> np.ndarray:
+    """Return open boundary edges (one incident face); closed STL has none."""
+    unique_edges = np.asarray(mesh.edges_unique)
+    inverse = np.asarray(mesh.edges_unique_inverse)
+    counts = np.bincount(inverse, minlength=len(unique_edges))
+    return unique_edges[counts == 1]
+
+
+def boundary_edge_distance_report(mesh: trimesh.Trimesh, points: np.ndarray,
+                                  units_per_mm: float) -> dict:
+    """Exact point-to-segment distances for open mesh boundary edges."""
+    edges = boundary_edges(mesh)
+    if len(edges) == 0:
+        return {
+            "available": False,
+            "reason": "STL has no open boundary edges; a crown margin loop cannot be inferred from this mesh.",
+            "boundary_edge_count": 0,
+        }
+
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    starts = vertices[edges[:, 0]]
+    vectors = vertices[edges[:, 1]] - starts
+    lengths_squared = np.einsum("ij,ij->i", vectors, vectors)
+    valid = lengths_squared > 1e-20
+    starts, vectors, lengths_squared = starts[valid], vectors[valid], lengths_squared[valid]
+    if len(starts) == 0:
+        return {"available": False, "reason": "All boundary edges are degenerate.", "boundary_edge_count": int(len(edges))}
+
+    minimum_squared = np.full(len(points), np.inf, dtype=np.float64)
+    # Bound memory while calculating exact closest points on line segments.
+    chunk_size = 1024
+    for begin in range(0, len(starts), chunk_size):
+        a = starts[begin:begin + chunk_size]
+        d = vectors[begin:begin + chunk_size]
+        denom = lengths_squared[begin:begin + chunk_size]
+        delta = points[:, None, :] - a[None, :, :]
+        t = np.einsum("psd,sd->ps", delta, d) / denom[None, :]
+        t = np.clip(t, 0.0, 1.0)
+        closest = a[None, :, :] + t[:, :, None] * d[None, :, :]
+        distances_squared = np.einsum("psd,psd->ps", points[:, None, :] - closest,
+                                      points[:, None, :] - closest)
+        minimum_squared = np.minimum(minimum_squared, np.min(distances_squared, axis=1))
+
+    distances_mm = np.sqrt(minimum_squared) / units_per_mm
+    return {
+        "available": True,
+        "boundary_edge_count": int(len(edges)),
+        "point_count": int(len(distances_mm)),
+        "max_mm": float(np.max(distances_mm)),
+        "median_mm": float(np.median(distances_mm)),
+        "p95_mm": float(np.percentile(distances_mm, 95)),
+        "all_points_below_0_1mm": bool(np.all(distances_mm < 0.1)),
+    }
+
+
+def select_jaw_scan(scans: list[dict], hint: str = "mandibular") -> tuple[int, dict]:
+    wanted = hint.casefold()
+    matches = [(i, item) for i, item in enumerate(scans)
+               if wanted in PurePosixPath(item["record"]["file_ref"]).name.casefold()]
+    if len(matches) != 1:
+        raise ValueError(
+            f"تعذّر تحديد مسح فك واحد من ScanFiles باستخدام --jaw-hint؛ عدد المطابقات: {len(matches)}."
+        )
+    return matches[0]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="فحص محلي لحالة exocad واحدة؛ لا يرفع الملفات ولا يثبت المحاذاة 100%.")
     parser.add_argument("--case", required=True, help="مسار مجلد الحالة أو ملف .rar")
@@ -314,6 +426,8 @@ def main() -> int:
     parser.add_argument("--constructioninfo", help="اسم XML إذا احتوى المجلد/الأرشيف أكثر من ملف")
     parser.add_argument("--crown", help="اسم تاج STL إذا لم يطابق 46-crown_cad.stl")
     parser.add_argument("--modeldie", help="اسم modeldie STL إذا لم يطابق 46-modeldie.stl")
+    parser.add_argument("--jaw-hint", default="mandibular",
+                        help="كلمة تميّز مرجع مسح الفك داخل FileName؛ الافتراضي mandibular")
     parser.add_argument("--units-per-mm", type=float, default=1.0,
                         help="عدد وحدات الإحداثيات في المليمتر؛ 1 يعني افتراض أن البيانات بالـ mm")
     args = parser.parse_args()
@@ -362,8 +476,89 @@ def main() -> int:
                 scan_reports.append({
                     "scan_index": scan_index,
                     "transformation_matrix_found": record["matrix"] is not None,
+                    "matrix_affine_layout_checks": record["affine_layout_checks"],
                     "candidate_meshes_written": variants_report,
                 })
+
+            jaw_scan_index, jaw_scan_item = select_jaw_scan(scans, args.jaw_hint)
+            jaw_geometry = load_geometry(jaw_scan_item["path"])
+            if not isinstance(jaw_geometry, trimesh.Trimesh) or len(jaw_geometry.faces) == 0:
+                raise ValueError("مسح الفك المحدد لازم يحتوي سطحًا مثلثيًا.")
+            jaw_matrix = jaw_scan_item["record"]["matrix"]
+            if jaw_matrix is None:
+                raise ValueError("مسح الفك المحدد لا يحتوي TransformationMatrix صالحة.")
+
+            jaw_dir = output_dir / "jaw_candidates"
+            jaw_dir.mkdir(parents=True, exist_ok=True)
+            jaw_candidate_reports: dict[str, dict] = {}
+            for variant_name, transform in matrix_variants(jaw_matrix):
+                candidate_mesh = jaw_geometry.copy()
+                candidate_mesh.apply_transform(transform)
+                candidate_mesh.export(str(jaw_dir / f"mandibular_{variant_name}.ply"))
+                try:
+                    jaw_candidate_reports[variant_name] = surface_distance_report(
+                        candidate_mesh, margins, args.units_per_mm
+                    )
+                except Exception as exc:
+                    jaw_candidate_reports[variant_name] = {"error": str(exc)}
+
+            crown_geometry = load_geometry(crown)
+            if not isinstance(crown_geometry, trimesh.Trimesh) or len(crown_geometry.faces) == 0:
+                raise ValueError("crown_cad لازم يحتوي سطحًا مثلثيًا.")
+            crown_dir = output_dir / "crown_candidates"
+            crown_dir.mkdir(parents=True, exist_ok=True)
+            crown_candidate_reports: dict[str, dict] = {}
+            crown_mesh_candidates: dict[str, trimesh.Trimesh] = {"crown_raw": crown_geometry.copy()}
+            for rotation_index, item in enumerate(parsed["z_rotation_matrices"]):
+                source = f"zrotation_{item['scope']}_{rotation_index}"
+                for variant_name, transform in matrix_variants(item["matrix"]):
+                    candidate_name = f"{source}_{variant_name}"
+                    candidate_mesh = crown_geometry.copy()
+                    candidate_mesh.apply_transform(transform)
+                    candidate_mesh.export(str(crown_dir / f"{candidate_name}.stl"))
+                    crown_mesh_candidates[candidate_name] = candidate_mesh
+
+            for candidate_name, candidate_mesh in crown_mesh_candidates.items():
+                try:
+                    edge_result = boundary_edge_distance_report(
+                        candidate_mesh, margins, args.units_per_mm
+                    )
+                except Exception as exc:
+                    edge_result = {"available": False, "error": str(exc)}
+                try:
+                    surface_result = surface_distance_report(
+                        candidate_mesh, margins, args.units_per_mm
+                    )
+                except Exception as exc:
+                    surface_result = {"error": str(exc)}
+                crown_candidate_reports[candidate_name] = {
+                    "crown_boundary_edge_vs_margin": edge_result,
+                    "whole_crown_surface_vs_margin": surface_result,
+                }
+
+            joint_threshold_mm = 0.1
+            joint_checks = []
+            qualifying_combinations = []
+            for jaw_name, jaw_result in jaw_candidate_reports.items():
+                jaw_max = jaw_result.get("max_mm")
+                for crown_name, crown_result in crown_candidate_reports.items():
+                    edge_result = crown_result["crown_boundary_edge_vs_margin"]
+                    edge_max = edge_result.get("max_mm")
+                    passes = bool(
+                        jaw_max is not None and edge_result.get("available")
+                        and edge_max is not None and jaw_max < joint_threshold_mm
+                        and edge_max < joint_threshold_mm
+                    )
+                    check = {
+                        "jaw_transform": jaw_name,
+                        "crown_transform": crown_name,
+                        "jaw_surface_max_mm": jaw_max,
+                        "crown_boundary_edge_max_mm": edge_max,
+                        "both_all_point_maxima_below_0_1mm": passes,
+                    }
+                    joint_checks.append(check)
+                    if passes:
+                        qualifying_combinations.append(check)
 
             distance_reports = []
             try:
@@ -401,31 +596,60 @@ def main() -> int:
                 construction_matrix_reports.append({
                     "index": matrix_index,
                     "scope": item["scope"],
-                    "row_interpretation_affine_check": bool(np.allclose(matrix[3], [0, 0, 0, 1], atol=1e-5)),
-                    "transpose_interpretation_affine_check": bool(np.allclose(matrix.T[3], [0, 0, 0, 1], atol=1e-5)),
+                    "affine_layout_checks": affine_layout_checks(matrix),
+                    "candidate_variants": [name for name, _ in variants],
                 })
+
+            z_rotation_reports = [
+                {
+                    "index": index,
+                    "scope": item["scope"],
+                    "affine_layout_checks": item["affine_layout_checks"],
+                    "candidate_variants": [name for name, _ in matrix_variants(item["matrix"])],
+                }
+                for index, item in enumerate(parsed["z_rotation_matrices"])
+            ]
 
             report = {
                 "case_check": "PASS: root ConstuctionInfo; ReconstructionType=AnatomicCrown; Number=46",
                 "scanfile_entries": len(scans),
                 "scanfile_transformations_found": sum(bool(x["record"]["matrix_present"]) for x in scans),
                 "matrix_to_scan_data_files_count": len(parsed["construction_matrices"]),
+                "z_rotation_matrix_count": len(parsed["z_rotation_matrices"]),
                 "margin_vec3_count": int(len(margins)),
                 "units_per_mm_assumption": args.units_per_mm,
                 "distance_threshold_mm": 0.5,
+                "joint_frame_threshold_mm": joint_threshold_mm,
+                "jaw_scan_index": jaw_scan_index,
                 "scanfile_transform_reports": scan_reports,
                 "matrix_to_scan_data_files_reports": construction_matrix_reports,
+                "z_rotation_matrix_reports": z_rotation_reports,
+                "margin_to_mandibular_surface_diagnostics": jaw_candidate_reports,
+                "margin_to_crown_boundary_diagnostics": crown_candidate_reports,
+                "joint_transform_combinations": {
+                    "requirement": "max distance of every Margin point to both jaw surface and crown boundary edge is strictly below 0.1 mm",
+                    "candidate_checks": joint_checks,
+                    "qualifying_combinations": qualifying_combinations,
+                    "qualifying_count": len(qualifying_combinations),
+                },
                 "margin_to_modeldie_distance_diagnostics": distance_reports,
                 "warning": (
-                    "لا تعتبر أقل من 0.5 mm ضمانًا للمحاذاة. تأكد بصريًا من الاتجاه والوحدات "
-                    "وموضع margin فوق PLY/modeldie في الإحداثيات نفسها. MatrixToScanDataFiles "
-                    "لم تُطبّق على PLY تلقائيًا لأنها منفصلة في XML عن TransformationMatrix داخل ScanFile."
+                    "الاختبار البنيوي للـ affine لا يثبت دلالة المصفوفة. ونتيجة أقل من 0.1 mm "
+                    "قرينة توافق هندسي وليست إثباتًا 100% أو اعتمادًا سريريًا. يلزم التحقق من "
+                    "الوحدات، وجود حافة مفتوحة تمثل margin في crown STL، والإطار المشترك بصريًا. "
+                    "إذا كان crown STL مغلقًا بلا boundary edges فلن يمكن استنتاج حافة التاج منه."
                 ),
             }
             (output_dir / "diagnostic_report.json").write_text(
                 json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             print(json.dumps(report, ensure_ascii=False, indent=2))
+            if qualifying_combinations:
+                print("\nوجدت تركيبات مرشحة تحقق < 0.1 mm على السطح والحافة معًا؛ هذا ليس إثباتًا نهائيًا:")
+                for item in qualifying_combinations:
+                    print(f"- jaw={item['jaw_transform']}, crown={item['crown_transform']}")
+            else:
+                print("\nلم توجد تركيبة تحقق < 0.1 mm لكل نقاط margin مقابل سطح الفك وحافة التاج معًا.")
             print(f"\nحُفظت النتائج محليًا في: {output_dir}")
             return 0
     except Exception as exc:
